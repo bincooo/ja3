@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"unicode"
 
 	"golang.org/x/net/http2"
@@ -28,6 +29,9 @@ type roundTripper struct {
 	tlsDial           func(req *http.Request) (*xtls.UConn, error)
 	helloId           xtls.ClientHelloID
 	proxies           string
+
+	mu          sync.Mutex
+	idleClosers []func()
 }
 
 type TransportArgs func(tripper *roundTripper)
@@ -78,6 +82,25 @@ func canonicalAddr(url *url.URL) string {
 	return net.JoinHostPort(idnaASCIIFromURL(url), port)
 }
 
+func (tripper *roundTripper) addCloser(yield func()) {
+	tripper.mu.Lock()
+	defer tripper.mu.Unlock()
+	tripper.idleClosers = append(tripper.idleClosers, yield)
+}
+
+func (tripper *roundTripper) CloseIdleConnections() {
+	tripper.mu.Lock()
+	defer tripper.mu.Unlock()
+
+	if tripper.idleClosers == nil || len(tripper.idleClosers) == 0 {
+		return
+	}
+
+	for _, apply := range tripper.idleClosers {
+		apply()
+	}
+}
+
 func (tripper *roundTripper) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	dialConn, err := tripper.tlsDial(req)
 	if err != nil {
@@ -98,8 +121,10 @@ func (tripper *roundTripper) RoundTrip(req *http.Request) (resp *http.Response, 
 		req.ProtoMinor = 1
 		err = req.Write(dialConn)
 		if err != nil {
+			_ = dialConn.Close()
 			return
 		}
+		tripper.addCloser(func() { dialConn.Close() })
 		return http.ReadResponse(bufio.NewReader(dialConn), req)
 
 	case "h2":
@@ -110,8 +135,10 @@ func (tripper *roundTripper) RoundTrip(req *http.Request) (resp *http.Response, 
 		var conn *http2.ClientConn
 		conn, err = tr.NewClientConn(dialConn)
 		if err != nil {
+			_ = dialConn.Close()
 			return
 		}
+		tripper.addCloser(func() { dialConn.Close() })
 		return conn.RoundTrip(req)
 
 	default:
