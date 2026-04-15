@@ -7,8 +7,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"golang.org/x/net/http2"
@@ -25,20 +27,79 @@ var portMap = map[string]string{
 	"socks5h": "1080",
 }
 
+func matchHost(pattern, host string) bool {
+	host = stripPort(host)
+	pattern = stripPort(pattern)
+
+	ok, err := path.Match(pattern, host)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+func stripPort(host string) string {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	return h
+}
+
 type roundTripper struct {
 	originalTransport *http.Transport
 	helloId           xtls.ClientHelloID
 	proxies           string
 
-	altMu sync.Mutex
+	mu    sync.RWMutex
+	rules map[string]*http.Transport
 }
 
 func (tripper *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return tripper.originalTransport.RoundTrip(req)
+	if tripper.rules == nil {
+		return tripper.originalTransport.RoundTrip(req)
+	}
+
+	host := req.URL.Host
+	transport := tripper.findTransport(host)
+	return transport.RoundTrip(req)
+}
+
+func (tripper *roundTripper) Rule(pattern string, idleConnTimeout int) {
+	if idleConnTimeout < 0 {
+		return
+	}
+
+	transport := tripper.originalTransport.Clone()
+	transport.IdleConnTimeout = time.Duration(idleConnTimeout) * time.Second
+	transport.DisableKeepAlives = idleConnTimeout == 0
+	//transport.ForceAttemptHTTP2 = idleConnTimeout != 0
+	dialTLS(tripper, transport)
+	tripper.rules[pattern] = transport
 }
 
 func (tripper *roundTripper) CloseIdleConnections() {
+	tripper.mu.Lock()
+	defer tripper.mu.Unlock()
+
+	for _, transport := range tripper.rules {
+		transport.CloseIdleConnections()
+	}
+
 	tripper.originalTransport.CloseIdleConnections()
+}
+
+func (tripper *roundTripper) CloseIdleConnection(pattern string) {
+	if pattern == "" {
+		tripper.originalTransport.CloseIdleConnections()
+		return
+	}
+
+	for rule, transport := range tripper.rules {
+		if matchHost(pattern, rule) {
+			transport.CloseIdleConnections()
+		}
+	}
 }
 
 type TransportArgs func(tripper *roundTripper)
@@ -96,7 +157,10 @@ func canonicalAddr(url *url.URL) string {
 }
 
 func NewTransport(args ...TransportArgs) http.RoundTripper {
-	var tripper = &roundTripper{}
+	var tripper = &roundTripper{
+		rules: make(map[string]*http.Transport),
+	}
+
 	if args != nil {
 		for _, apply := range args {
 			apply(tripper)
@@ -118,6 +182,10 @@ func NewTransport(args ...TransportArgs) http.RoundTripper {
 		return nil, nil
 	}
 
+	return dialTLS(tripper, tripper.originalTransport)
+}
+
+func dialTLS(tripper *roundTripper, transport *http.Transport) http.RoundTripper {
 	// https tls 请求
 	dialTLSContext := func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 		config := xtls.Config{
@@ -151,11 +219,11 @@ func NewTransport(args ...TransportArgs) http.RoundTripper {
 		return uTlsConn, nil
 	}
 
-	tripper.originalTransport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialTLSContext(ctx, network, addr, tripper.originalTransport.TLSClientConfig)
+	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialTLSContext(ctx, network, addr, transport.TLSClientConfig)
 	}
 
-	h2, err := http2.ConfigureTransports(tripper.originalTransport)
+	h2, err := http2.ConfigureTransports(transport)
 	if err != nil {
 		panic(fmt.Errorf("error configuring H2 transport: %+v", err))
 	}
@@ -187,6 +255,19 @@ func (tripper *roundTripper) getProxy(schema string) string {
 		}
 	}
 	return proxies
+}
+
+func (tripper *roundTripper) findTransport(host string) http.RoundTripper {
+	tripper.mu.RLock()
+	defer tripper.mu.RUnlock()
+
+	for rule, transport := range tripper.rules {
+		if matchHost(rule, host) {
+			return transport
+		}
+	}
+
+	return tripper.originalTransport
 }
 
 func newConn(ctx context.Context, proxies, addr string, cfg *tls.Config) (dialConn net.Conn, err error) {
